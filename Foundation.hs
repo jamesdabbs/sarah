@@ -1,3 +1,5 @@
+{-# LANGUAGE ConstraintKinds      #-}
+{-# LANGUAGE UndecidableInstances #-}
 module Foundation where
 
 import Prelude
@@ -20,6 +22,11 @@ import Text.Jasmine (minifym)
 import Text.Hamlet (hamletFile)
 import Yesod.Core.Types (Logger)
 
+import Control.Concurrent (forkIO, threadDelay)
+import Control.Monad (forever, liftM, replicateM_)
+import Control.Monad.Trans.Resource (MonadResourceBase, runResourceT, withInternalState)
+import Data.Monoid ((<>))
+import qualified Data.Text as T
 import Jobs
 
 -- | The site argument for your application. This can be a good place to
@@ -52,6 +59,64 @@ mkMessage "App" "messages" "en"
 mkYesodData "App" $(parseRoutesFile "config/routes")
 
 type Form x = Html -> MForm (HandlerT App IO) (FormResult x, Widget)
+
+type Worker = WorkerT App IO
+
+class MonadResource m => MonadWorker m where
+  type WorkerSite m
+  liftWorkerT :: WorkerT (WorkerSite m) IO a -> m a
+
+instance MonadResourceBase m => MonadWorker (WorkerT site m) where
+  type WorkerSite (WorkerT site m) = site
+  liftWorkerT (WorkerT f) = WorkerT $ liftIO . f -- . replaceToParent
+{-# RULES "liftHandlerT (HandlerT site IO)" liftHandlerT = id #-}
+
+askWorkerEnv :: MonadWorker m => m (RunWorkerEnv (WorkerSite m))
+askWorkerEnv = liftWorkerT $ WorkerT $ return . workerEnv
+
+getYesodW :: MonadWorker m => m (WorkerSite m)
+getYesodW = rweSite `liftM` askWorkerEnv
+
+runW :: SqlPersistT Worker a -> Worker a
+runW f = do
+  app <- getYesodW
+  Database.Persist.runPool (persistConfig app) f (connPool app)
+
+test :: Worker [Entity Feed]
+test = do
+  $(logDebug) "Testing logging"
+  runW $ selectList [] []
+
+perform :: Job -> Worker ()
+perform (RunFeedJob _id) = do
+  $(logDebug) $ "-- Trying " <> (T.pack $ show _id)
+  mfeed <- runW . get $ _id
+  case mfeed of
+    Just feed -> do
+      $(logDebug) $ "-- Running feed " <> (T.pack . show $ feedUrl feed)
+      liftIO $ threadDelay 5000000
+    Nothing -> return ()
+
+runWorker :: App -> Worker a -> IO a
+runWorker site worker = runResourceT . withInternalState $ \resState -> do
+  let rwe = RunWorkerEnv
+            { rweSite = site
+            , rweLog = messageLoggerSource site $ appLogger site
+            }
+  let wd = WorkerData
+           { workerResource = resState
+           , workerEnv = rwe
+           }
+  -- FIXME: catch and handle errors (see unHandlerT)
+  unWorkerT worker wd
+
+spawnWorkers :: App -> IO ()
+spawnWorkers site = do
+  replicateM_ (extraWorkers . appExtra . settings $ site) . forkIO . forever $ do
+    mj <- dequeueJob $ jobQueue site
+    case mj of
+      Just job -> runWorker site $ perform job
+      Nothing -> threadDelay 1000000
 
 -- Please see the documentation for the Yesod typeclass. There are a number
 -- of settings which can be configured by overriding methods here.

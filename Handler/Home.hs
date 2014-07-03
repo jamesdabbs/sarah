@@ -11,7 +11,7 @@ import Jobs
 queue :: Job -> Handler ()
 queue job = do
   app <- getYesod
-  liftIO $ queueJob (jobQueue app) job
+  liftIO $ enqueueJob (jobQueue app) job
 
 getHomeR :: Handler Html
 getHomeR = do

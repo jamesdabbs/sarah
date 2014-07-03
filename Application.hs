@@ -83,10 +83,12 @@ makeFoundation conf = do
             updateLoop
     _ <- forkIO updateLoop
 
-    q <- spawnWorkers p dbconf (extraWorkers . appExtra $ conf)
+    q <- emptyQueue
 
     let logger = Yesod.Core.Types.Logger loggerSet' getter
         foundation = App conf s p manager dbconf logger q
+
+    _ <- spawnWorkers foundation
 
     -- Perform database migration using our application's logging settings.
     runLoggingT

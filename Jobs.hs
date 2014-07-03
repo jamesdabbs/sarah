@@ -1,27 +1,35 @@
+{-# LANGUAGE FlexibleInstances    #-}
+{-# LANGUAGE UndecidableInstances #-}
 module Jobs
 ( Job (..)
 , JobQueue
-, spawnWorkers
-, queueJob
+-- , spawnWorkers
+, emptyQueue
+, enqueueJob
+, dequeueJob
+, WorkerT (..)
+, WorkerData (..)
+, RunWorkerEnv (..)
 ) where
 
 import Prelude
 import Model
 
-import Control.Concurrent (forkIO, threadDelay)
 import Control.Concurrent.STM
-import Control.Monad (forever, replicateM_)
 import Control.Monad.IO.Class (liftIO)
-import Control.Monad.Logger (runStdoutLoggingT)
-import Control.Monad.Trans.Resource (runResourceT)
-import Data.Monoid ((<>))
 import qualified Data.Sequence as S
-import Database.Persist
 
-import Settings (PersistConf)
+import Control.Applicative (Applicative (..))
+import Control.Monad (liftM, ap)
+import Control.Monad.Base (MonadBase (liftBase))
+import Control.Monad.IO.Class (MonadIO (..))
+import Control.Monad.Logger (LogLevel, LogSource, MonadLogger (..))
+import Control.Monad.Trans.Class (MonadTrans (..))
+import Control.Monad.Trans.Control (MonadBaseControl (..))
+import Control.Monad.Trans.Resource (MonadResource (..), InternalState, runInternalState, MonadThrow (..), monadThrow)
+import Language.Haskell.TH.Syntax (Loc)
+import System.Log.FastLogger (LogStr, toLogStr)
 
-import Data.Time (getCurrentTime)
-import System.Random (randomRIO)
 
 -- The intention is for Job to be a sum type, with different `perform` implementations
 --   for each constructor. For now, we just have the one:
@@ -30,9 +38,53 @@ data Job = RunFeedJob FeedId
 -- A job queue is simply a sequence of jobs that multiple threads can access safely (using STM)
 type JobQueue = TVar (S.Seq Job)
 
+data RunWorkerEnv site = RunWorkerEnv
+  { rweSite     :: !site
+  , rweLog      :: !(Loc -> LogSource -> LogLevel -> LogStr -> IO ())
+  -- , rheOnError  :: !(ErrorResponse -> YesodApp)
+  }
+data WorkerData site = WorkerData
+  { workerResource :: !InternalState
+  , workerEnv      :: !(RunWorkerEnv site)
+  }
+
+newtype WorkerT site m a = WorkerT
+  { unWorkerT :: WorkerData site -> m a
+  }
+
+instance MonadTrans (WorkerT site) where
+  lift = WorkerT . const
+instance Monad m => Functor (WorkerT site m) where
+  fmap = liftM
+instance Monad m => Applicative (WorkerT site m) where
+  pure = return
+  (<*>) = ap
+instance MonadIO m => MonadIO (WorkerT site m) where
+  liftIO = lift . liftIO
+instance MonadBase b m => MonadBase b (WorkerT site m) where
+  liftBase = lift . liftBase
+-- TODO: absorb the instance declarations below
+instance Monad m => Monad (WorkerT site m) where
+  return = WorkerT . const . return
+  WorkerT x >>= f = WorkerT $ \r -> x r >>= \x' -> unWorkerT (f x') r
+instance MonadBaseControl b m => MonadBaseControl b (WorkerT site m) where
+  data StM (WorkerT site m) a = StH (StM m a)
+  liftBaseWith f = WorkerT $ \reader ->
+    liftBaseWith $ \runInBase ->
+      f $ liftM StH . runInBase . (\(WorkerT r) -> r reader)
+  restoreM (StH base) = WorkerT $ const $ restoreM base
+instance MonadThrow m => MonadThrow (WorkerT site m) where
+  throwM = lift . monadThrow
+instance (MonadIO m, MonadBase IO m, MonadThrow m) => MonadResource (WorkerT site m) where
+  liftResourceT f = WorkerT $ \hd -> liftIO $ runInternalState f (workerResource hd)
+instance MonadIO m => MonadLogger (WorkerT site m) where
+  monadLoggerLog a b c d = WorkerT $ \hd ->
+    liftIO $ rweLog (workerEnv hd) a b c (toLogStr d)
+
+
 -- Basic helpers for using a Sequence as a queue
 enqueue :: S.Seq a -> a -> S.Seq a
-enqueue xs x = xs S.|> x
+enqueue = (S.|>)
 
 dequeue :: S.Seq a -> Maybe (a, S.Seq a)
 dequeue s = case S.viewl s of
@@ -41,8 +93,8 @@ dequeue s = case S.viewl s of
 
 
 -- The public API for queueing a job
-queueJob :: JobQueue -> Job -> IO ()
-queueJob qvar j = atomically . modifyTVar qvar $ \v -> enqueue v j
+enqueueJob :: JobQueue -> Job -> IO ()
+enqueueJob qvar j = atomically . modifyTVar qvar $ \v -> enqueue v j
 
 dequeueJob :: JobQueue -> IO (Maybe Job)
 dequeueJob qvar = atomically $ do
@@ -53,33 +105,5 @@ dequeueJob qvar = atomically $ do
       return $ Just x
     Nothing -> return Nothing
 
--- Starts an empty job queue and some number of workers to consume from that queue
-spawnWorkers :: PersistConfigPool PersistConf -> PersistConf -> Int -> IO JobQueue
-spawnWorkers pool dbconf n = do
-  q <- atomically $ newTVar S.empty
-  replicateM_ n . forkIO . forever $ do
-    qi <- dequeueJob q
-    case qi of
-      Just i -> perform pool dbconf i
-      Nothing -> threadDelay 1000000
-  return q
-
--- This allows us to run db queries inside a worker, similar to runDB inside a Handler
-runDBIO pool dbconf f = runStdoutLoggingT . runResourceT $ runPool dbconf f pool
-
--- `perform` defines the actual work to be done for each type of job
--- TODO: figure out monadic sugar so that we can use e.g. runW and not need to pass in
---       pool and dbconf
---   also, figure out a getBy404 equivalent
---   also also, hook in logging (w/ numbered workers?)
-perform pool dbconf (RunFeedJob _id) = do
-  now <- liftIO getCurrentTime
-  liftIO . putStrLn $ (show now) <> "  -- Trying " <> (show _id)
-  mfeed <- runDBIO pool dbconf . get $ _id
-  liftIO $ case mfeed of
-    Just feed -> do
-      putStrLn $ (show now) <> "  -- Running feed '" <> (show $ feedUrl feed) <> "'"
-      -- Pretend these are variably complicated units of work
-      sleep <- randomRIO (1,10)
-      threadDelay $ sleep * 1000000
-    Nothing -> return ()
+emptyQueue :: IO JobQueue
+emptyQueue = atomically $ newTVar S.empty
