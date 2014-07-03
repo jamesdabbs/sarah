@@ -25,6 +25,8 @@ import Network.Wai.Logger (clockDateCacher)
 import Data.Default (def)
 import Yesod.Core.Types (loggerSet, Logger (Logger))
 
+import Jobs
+
 -- Import all relevant handler modules here.
 -- Don't forget to add new modules to your cabal file!
 import Handler.Home
@@ -81,8 +83,10 @@ makeFoundation conf = do
             updateLoop
     _ <- forkIO updateLoop
 
+    q <- spawnWorkers p dbconf (extraWorkers . appExtra $ conf)
+
     let logger = Yesod.Core.Types.Logger loggerSet' getter
-        foundation = App conf s p manager dbconf logger
+        foundation = App conf s p manager dbconf logger q
 
     -- Perform database migration using our application's logging settings.
     runLoggingT

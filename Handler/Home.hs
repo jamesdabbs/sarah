@@ -3,37 +3,31 @@ module Handler.Home where
 
 import Import
 
--- This is a handler function for the GET request method on the HomeR
--- resource pattern. All of your resource patterns are defined in
--- config/routes
---
--- The majority of the code you will write in Yesod lives in these handler
--- functions. You can spread them across multiple files if you are so
--- inclined, or create a single monolithic file.
+import qualified Data.Text as T
+import Data.Time (getCurrentTime)
+import Jobs
+
+-- Simple helper for throwing jobs on to the application's queue
+queue :: Job -> Handler ()
+queue job = do
+  app <- getYesod
+  liftIO $ queueJob (jobQueue app) job
+
 getHomeR :: Handler Html
 getHomeR = do
-    (formWidget, formEnctype) <- generateFormPost sampleForm
-    let submission = Nothing :: Maybe (FileInfo, Text)
-        handlerName = "getHomeR" :: Text
-    defaultLayout $ do
-        aDomId <- newIdent
-        setTitle "Welcome To Yesod!"
-        $(widgetFile "homepage")
+  -- Test out the workers on several dummy jobs, some of which
+  --   are deleted by the time the workers run
+  feeds <- mapM createFeed [1..10]
+  mapM_ (runDB . delete) $ take 5 feeds
+  mapM_ (queue . RunFeedJob) feeds
 
-postHomeR :: Handler Html
-postHomeR = do
-    ((result, formWidget), formEnctype) <- runFormPost sampleForm
-    let handlerName = "postHomeR" :: Text
-        submission = case result of
-            FormSuccess res -> Just res
-            _ -> Nothing
+  defaultLayout $ do
+    setTitle "Worker test"
+    $(widgetFile "homepage")
 
-    defaultLayout $ do
-        aDomId <- newIdent
-        setTitle "Welcome To Yesod!"
-        $(widgetFile "homepage")
-
-sampleForm :: Form (FileInfo, Text)
-sampleForm = renderDivs $ (,)
-    <$> fileAFormReq "Choose a file"
-    <*> areq textField "What's on the file?" Nothing
+  where
+    createFeed :: Int -> Handler FeedId
+    createFeed n = do
+      now <- liftIO getCurrentTime
+      runDB . insert $ Feed url now now now
+      where url = T.pack $ "this is feed url #" ++ show n
