@@ -15,6 +15,7 @@ import Control.Monad.IO.Class (liftIO)
 import Control.Monad.Logger (runStdoutLoggingT)
 import Control.Monad.Trans.Resource (runResourceT)
 import Data.Monoid ((<>))
+import qualified Data.Sequence as S
 import Database.Persist
 
 import Settings (PersistConf)
@@ -26,40 +27,42 @@ import System.Random (randomRIO)
 --   for each constructor. For now, we just have the one:
 data Job = RunFeedJob FeedId
 
--- A job queue is simply a list of jobs that multiple threads can access safely (using STM)
-type JobQueue = TVar [Job]
+-- A job queue is simply a sequence of jobs that multiple threads can access safely (using STM)
+type JobQueue = TVar (S.Seq Job)
 
--- Helper methods for threadsafe pushes and pops
-aPop :: TVar [a] -> STM (Maybe a)
-aPop qvar = do
+-- Basic helpers for using a Sequence as a queue
+enqueue :: S.Seq a -> a -> S.Seq a
+enqueue xs x = xs S.|> x
+
+dequeue :: S.Seq a -> Maybe (a, S.Seq a)
+dequeue s = case S.viewl s of
+  x S.:< xs -> Just (x, xs)
+  _         -> Nothing
+
+
+-- The public API for queueing a job
+queueJob :: JobQueue -> Job -> IO ()
+queueJob qvar j = atomically . modifyTVar qvar $ \v -> enqueue v j
+
+dequeueJob :: JobQueue -> IO (Maybe Job)
+dequeueJob qvar = atomically $ do
   q <- readTVar qvar
-  case q of
-    (x:xs) -> do
+  case dequeue q of
+    Just (x,xs) -> do
       writeTVar qvar xs
       return $ Just x
-    _ -> return Nothing
-
-aPush :: TVar [a] -> a -> STM ()
-aPush qvar x = do
-  xs <- readTVar qvar
-  writeTVar qvar $ xs ++ [x] -- TODO: use a structure with efficient appends
-
--- The public API for queueing a job. Internally, this simply pushes it onto the list.
-queueJob :: JobQueue -> Job -> IO ()
-queueJob q = atomically . aPush q
+    Nothing -> return Nothing
 
 -- Starts an empty job queue and some number of workers to consume from that queue
 spawnWorkers :: PersistConfigPool PersistConf -> PersistConf -> Int -> IO JobQueue
 spawnWorkers pool dbconf n = do
-  q <- atomically $ newTVar []
-  replicateM_ n . forkIO $ work q
+  q <- atomically $ newTVar S.empty
+  replicateM_ n . forkIO . forever $ do
+    qi <- dequeueJob q
+    case qi of
+      Just i -> perform pool dbconf i
+      Nothing -> threadDelay 1000000
   return q
-  where
-    work q = forever $ do
-      qi <- atomically $ aPop q
-      case qi of
-        Just i -> perform pool dbconf i
-        Nothing -> threadDelay 1000000
 
 -- This allows us to run db queries inside a worker, similar to runDB inside a Handler
 runDBIO pool dbconf f = runStdoutLoggingT . runResourceT $ runPool dbconf f pool
