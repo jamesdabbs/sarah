@@ -25,7 +25,8 @@ import Network.Wai.Logger (clockDateCacher)
 import Data.Default (def)
 import Yesod.Core.Types (loggerSet, Logger (Logger))
 
-import Jobs
+import Yesod.Worker (emptyQueue, spawnWorkers)
+import Jobs ()
 
 -- Import all relevant handler modules here.
 -- Don't forget to add new modules to your cabal file!

@@ -14,13 +14,17 @@ Flag library-only
 library
     exposed-modules: Application
                      Foundation
-                     Jobs
                      Import
                      Model
                      Settings
                      Settings.StaticFiles
                      Settings.Development
                      Handler.Home
+                     Yesod.Worker
+                     Yesod.Worker.Queue
+                     Yesod.Worker.Types
+                     Jobs
+                     Jobs.Types
 
     if flag(dev) || flag(library-only)
         cpp-options:   -DDEVELOPMENT

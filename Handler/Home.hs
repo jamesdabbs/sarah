@@ -5,13 +5,9 @@ import Import
 
 import qualified Data.Text as T
 import Data.Time (getCurrentTime)
-import Jobs
+import Jobs (Job (RunFeedJob))
+import Yesod.Worker (enqueue)
 
--- Simple helper for throwing jobs on to the application's queue
-queue :: Job -> Handler ()
-queue job = do
-  app <- getYesod
-  liftIO $ enqueueJob (jobQueue app) job
 
 getHomeR :: Handler Html
 getHomeR = do
@@ -19,7 +15,7 @@ getHomeR = do
   --   are deleted by the time the workers run
   feeds <- mapM createFeed [1..10]
   mapM_ (runDB . delete) $ take 5 feeds
-  mapM_ (queue . RunFeedJob) feeds
+  mapM_ (enqueue . RunFeedJob) feeds
 
   defaultLayout $ do
     setTitle "Worker test"
